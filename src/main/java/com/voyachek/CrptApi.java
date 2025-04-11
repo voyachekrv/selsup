@@ -350,8 +350,8 @@ public class CrptApi {
             } catch (InterruptedException e) {
                 try {
                     throw e;
-                } catch (InterruptedException ex) {
-                    throw new RuntimeException(ex);
+                } catch (InterruptedException exc) {
+                    throw new RuntimeException(exc);
                 }
             }
             return cryptoSign.sign(response.data);
