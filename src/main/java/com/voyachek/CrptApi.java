@@ -18,41 +18,39 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
-/*
-* 1. Получить токен с использованием кэша
-* "key": "token",
-* Алгоритм функции value:
-* 1. Получить токен из кэша
-* 2. Если токена нет, то подписываем присланный ключ (get key), получаем токен через апи (get token)
-*
-* Сделать свои exceptions
-* Сделать класс конфигураций
-* Сделать удаление токена из кэша, если пришел ответ 401
-* Кэш будет храниться 10 часов
-* добавить slf4j
-* метрики через микрометр
-* трассировку через open telemetry
-*/
-
+/**
+ * API для создания документов в системе Честного знака
+ */
 public class CrptApi {
 
+    /** Логгер */
     private static final Logger logger = LoggerFactory.getLogger(CrptApi.class);
 
+    /** Кэш */
     public interface Cache {
+        /** Получение значения из кэша */
         String get(String key, Function<String, String> value);
 
+        /** Удаление значения из кэша */
         void delete(String key);
     }
 
+    /** API подписи ключа */
     public interface CryptoSign {
         String sign(String value);
     }
 
+    /** Исключения */
     public static class CrptApiException extends RuntimeException {
         public enum ErrorCode {
+            /** Ошибка подключения */
             CONNECTION_ERROR,
+            /** Ошибка HTTP-статуса */
             STATUS_CODE_ERROR,
-            RESPONSE_FORMAT_ERROR
+            /** Ошибка формата вывода */
+            RESPONSE_FORMAT_ERROR,
+            /** Ошибка ввода-вывода */
+            IO_ERROR
         }
 
         public int statusCode = -1;
@@ -69,10 +67,15 @@ public class CrptApi {
         }
     }
 
+    /** Конфигурация приложения */
     public static class AppConfig {
+        /** Протокол хоста API */
         public final String apiProtocol = "http";
+        /** Хост API */
         public final String apiHost = "localhost:3000";
+        /** Лимит запросов */
         public final int requestLimit = 100;
+        /** Единица времени */
         public final TimeUnit timeUnit = TimeUnit.SECONDS;
     }
 
@@ -137,6 +140,11 @@ public class CrptApi {
          * Уникальный идентификатор документа в ИС МП
          */
         public String value;
+
+        @Override
+        public String toString() {
+            return "{value=" + value + '\"' + '}';
+        }
     }
 
     /**
@@ -158,6 +166,9 @@ public class CrptApi {
         }
     }
 
+    /**
+     * DTO результата запроса авторизации
+     */
     private static class CertKeyPayload {
         public String uuid;
         public String data;
@@ -173,39 +184,49 @@ public class CrptApi {
     /** HTTP-клиент */
     private final HttpClient httpClient;
 
+    /** Конфигурация приложения */
     private final AppConfig appConfig;
 
+    /** Маппер объектов */
     private final ObjectMapper objectMapper;
 
+    /** Кэш*/
     private Cache cache;
+    /** API подписи ключа */
     private CryptoSign cryptoSign;
 
+    /** Метрики для метода вызова API */
     private static class Metrics {
         public final Counter successCounter;
         public final Counter failureCounter;
         public final Timer executionTimer;
 
         private Metrics(MeterRegistry meterRegistry, String methodName) {
-            this.successCounter = Counter.builder("crptapi.create.success")
+            this.successCounter = Counter.builder(String.format("crptapi.%s.success", methodName))
                     .tags("method", methodName)
-                    .description("Количество успешных вызовов создания документа")
+                    .description("Количество успешных вызовов метода")
                     .register(meterRegistry);
 
-            this.failureCounter = Counter.builder("crptapi.create.failure")
+            this.failureCounter = Counter.builder(String.format("crptapi.%s.failure", methodName))
                     .tags("method", methodName)
-                    .description("Количество неудачных вызовов создания документа")
+                    .description("Количество неудачных вызовов метода")
                     .register(meterRegistry);
 
-            this.executionTimer = Timer.builder("crptapi.create.duration")
+            this.executionTimer = Timer.builder(String.format("crptapi.%s.duration", methodName))
                     .tags("method", methodName)
-                    .description("Длительность создания документа")
+                    .description("Длительность работы метода")
                     .register(meterRegistry);
         }
     }
 
+    /** Мап метрик для методов API */
     Map<String, Metrics> metricsMap = new HashMap<>();
 
     /**
+     * @param appConfig Конфигурация приложения
+     * @param cache Кэш
+     * @param cryptoSign API подписи ключа
+     * @param meterRegistry Регистратор метрик
      */
     public CrptApi(AppConfig appConfig, CrptApi.Cache cache, CrptApi.CryptoSign cryptoSign, MeterRegistry meterRegistry) {
         this.metricsMap.put("createDocumentOfRussianProduct", new Metrics(meterRegistry, "createDocumentOfRussianProduct"));
@@ -247,6 +268,55 @@ public class CrptApi {
     }
 
     /**
+     * Вызов POST-метода API честного знака
+     * @param <R> Тип возвращаемого значения
+     * @param methodName Наименование метода
+     * @param url URL метода API
+     * @param payload Тело метода API в виде строки
+     * @param returnType Тип возвращаемого значения
+     */
+    private <R> R callPostApi(String methodName, String url, String payload, Class<R> returnType) {
+        var metrics = metricsMap.get(methodName);
+        return metrics.executionTimer.record(() -> {
+            logger.info("{}: payload = {}", methodName, payload);
+            try {
+                acquirePermit();
+
+                var request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + getToken())
+                        .POST(HttpRequest.BodyPublishers.ofString(payload))
+                        .build();
+
+                var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 401) {
+                    cache.delete("token");
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                }
+
+                if (response.statusCode() >= 400) {
+                    System.out.println(response.statusCode());
+                    throw new CrptApiException(response.statusCode());
+                }
+
+                var bodyString = response.body();
+
+                var responseBody = objectMapper.readValue(bodyString, returnType);
+
+                logger.info("success: {}: result = {}", methodName, responseBody);
+
+                return responseBody;
+            } catch (Exception e) {
+                logger.error("error on method: {}, error: ", methodName, e);
+                metrics.failureCounter.increment();
+                throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
+            }
+        });
+    }
+
+    /**
      * Создаёт документ для ввода в оборот товара, произведенного в РФ.
      *
      * @param document Объект документа.
@@ -254,29 +324,23 @@ public class CrptApi {
      * @return объект `DocumentId`, содержащий статус ответа и тело ответа.
      */
     public DocumentId createDocumentOfRussianProduct(DocumentRussianProductIntroduction document, String signature) {
-        var metrics = metricsMap.get("createDocumentOfRussianProduct");
-        return metrics.executionTimer.record(() -> {
-            logger.info("Попытка создания документа: тип = {}, группа = {}", document.documentType.documentTypeRussianProduct, document.productGroup);
-            try {
-                acquirePermit();
-
-                var payload = preparePayload(document, signature);
-
-                var result = createDocument(payload, this.getToken());
-
-                logger.info("Документ успешно создан. ID = {}", result.value);
-                metrics.successCounter.increment();
-
-                return result;
-            } catch (Exception e) {
-                logger.error("Ошибка при создании документа", e);
-                metrics.failureCounter.increment();
-                throw new CrptApiException(e, CrptApiException.ErrorCode.CONNECTION_ERROR);
-            }
-        });
+        try {
+            var payload = preparePayload(document, signature);
+            return callPostApi(
+                    "createDocumentOfRussianProduct",
+                    String.format("%s://%s/api/v3/lk/documents/create", appConfig.apiProtocol, appConfig.apiHost),
+                    payload,
+                    DocumentId.class
+            );
+        } catch (JsonProcessingException e) {
+            throw new CrptApiException(e, CrptApiException.ErrorCode.RESPONSE_FORMAT_ERROR);
+        }
     }
 
-    private String getToken() throws IOException, InterruptedException {
+    /**
+     * Получение токена из кэша, если токена не найден, то производится подпись нового токена
+     */
+    private String getToken() {
         return cache.get("token", (token) -> {
             CertKeyPayload response = null;
             try {
@@ -302,40 +366,6 @@ public class CrptApi {
                 signature
         );
         return objectMapper.writeValueAsString(payload);
-    }
-
-    /**
-     * Создание документа на основе тела
-     */
-    private DocumentId createDocument(String payload, String token) throws IOException, InterruptedException {
-        var request = HttpRequest.newBuilder()
-                .uri(URI.create(String.format("%s://%s/api/v3/lk/documents/create", appConfig.apiProtocol, appConfig.apiHost)))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + token)
-                .POST(HttpRequest.BodyPublishers.ofString(payload))
-                .build();
-
-        var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() == 401) {
-            cache.delete("token");
-            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-        }
-
-        if (response.statusCode() >= 400) {
-            throw new CrptApiException(response.statusCode());
-        }
-
-        var body = response.body();
-
-        return mapResponse(body);
-    }
-
-    /**
-     * Маппинг ответа от API в
-     */
-    private DocumentId mapResponse(String response) throws JsonProcessingException {
-        return objectMapper.readValue(response, DocumentId.class);
     }
 
     private CertKeyPayload fetchCertKey() throws IOException, InterruptedException {
