@@ -342,13 +342,17 @@ public class CrptApi {
      */
     private String getToken() {
         return cache.get("token", (token) -> {
-            CertKeyPayload response = null;
+            CertKeyPayload response;
             try {
                 response = fetchCertKey();
             } catch (IOException e) {
-                return cryptoSign.sign(response.data);
+                throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
             } catch (InterruptedException e) {
-                return cryptoSign.sign(response.data);
+                try {
+                    throw e;
+                } catch (InterruptedException ex) {
+                    throw new RuntimeException(ex);
+                }
             }
             return cryptoSign.sign(response.data);
         });
@@ -372,7 +376,7 @@ public class CrptApi {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(String.format("%s://%s/api/v3/auth/cert/key", appConfig.apiProtocol, appConfig.apiHost)))
                 .GET()
-                .header("Accept", "application/json") // можно убрать, если не требуется
+                .header("Accept", "application/json")
                 .build();
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
