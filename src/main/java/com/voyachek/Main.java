@@ -7,9 +7,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
-class CacheImpl implements CrptApi.Cache {
+class CacheImpl implements CrptApi.TokenCache {
 
     private final Map<String, String> cache = new HashMap<>();
 
@@ -39,14 +40,18 @@ class CryptoSignImpl implements CrptApi.CryptoSign {
 
 public class Main {
     public static void main(String[] args) {
-        var crptApi = new CrptApi(new CrptApi.AppConfig(), new CacheImpl(), new CryptoSignImpl(), new SimpleMeterRegistry());
+        try {
+            var crptApi = new CrptApi(new CrptApi.AppConfig(), new CacheImpl(), new CryptoSignImpl(), new SimpleMeterRegistry());
 
-        var document = crptApi.createDocumentOfRussianProduct(new CrptApi.DocumentRussianProductIntroduction(
-                CrptApi.DocumentTypeRussianProductIntroduction.MANUAL,
-                CrptApi.ProductGroup.MILK,
-                "document"
-        ), "abc");
+            var document = crptApi.createDocumentOfRussianProduct(new CrptApi.DocumentRussianProductIntroduction(
+                    CrptApi.DocumentTypeRussianProductIntroduction.MANUAL,
+                    CrptApi.ProductGroup.MILK,
+                    "document"
+            ), "abc");
 
-        System.out.println(document.value);
+            System.out.println(document.value);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

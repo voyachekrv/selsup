@@ -1,6 +1,6 @@
 package com.voyachek;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -15,6 +15,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -27,7 +28,7 @@ public class CrptApi {
     private static final Logger logger = LoggerFactory.getLogger(CrptApi.class);
 
     /** Кэш */
-    public interface Cache {
+    public interface TokenCache {
         /** Получение значения из кэша */
         String get(String key, Function<String, String> value);
 
@@ -48,7 +49,7 @@ public class CrptApi {
             /** Ошибка HTTP-статуса */
             STATUS_CODE_ERROR,
             /** Ошибка формата вывода */
-            RESPONSE_FORMAT_ERROR,
+            FORMAT_ERROR,
             /** Ошибка ввода-вывода */
             IO_ERROR
         }
@@ -65,26 +66,66 @@ public class CrptApi {
             this.errorCode = ErrorCode.STATUS_CODE_ERROR;
             this.statusCode = statusCode;
         }
+
+        @Override
+        public String toString() {
+            return "CrptApiException{" +
+                    "statusCode=" + statusCode +
+                    ", errorCode=" + errorCode +
+                    '}';
+        }
     }
 
     /** Конфигурация приложения */
     public static class AppConfig {
         /** Протокол хоста API */
-        public final String apiProtocol = "http";
+        private String apiProtocol = "http";
         /** Хост API */
-        public final String apiHost = "localhost:3000";
+        private String apiHost = "localhost:3000";
         /** Лимит запросов */
-        public final int requestLimit = 100;
+        private int requestLimit = 100;
         /** Единица времени */
-        public final TimeUnit timeUnit = TimeUnit.SECONDS;
+        private TimeUnit timeUnit = TimeUnit.SECONDS;
+
+        public String getApiProtocol() {
+            return apiProtocol;
+        }
+
+        public String getApiHost() {
+            return apiHost;
+        }
+
+        public int getRequestLimit() {
+            return requestLimit;
+        }
+
+        public TimeUnit getTimeUnit() {
+            return timeUnit;
+        }
+
+        public void setApiProtocol(String apiProtocol) {
+            this.apiProtocol = apiProtocol;
+        }
+
+        public void setApiHost(String apiHost) {
+            this.apiHost = apiHost;
+        }
+
+        public void setRequestLimit(int requestLimit) {
+            this.requestLimit = requestLimit;
+        }
+
+        public void setTimeUnit(TimeUnit timeUnit) {
+            this.timeUnit = timeUnit;
+        }
     }
 
     /**
      * Представление формата документа для ввода в оборот российского товара
      */
     public static class DocumentIntroductionFormat {
-        public String documentTypeFormat;
-        public String documentTypeRussianProduct;
+        public final String documentTypeFormat;
+        public final String documentTypeRussianProduct;
 
         public DocumentIntroductionFormat(String documentTypeFormat, String documentTypeRussianProduct) {
             this.documentTypeFormat = documentTypeFormat;
@@ -121,9 +162,9 @@ public class CrptApi {
      * Документ на ввод в оборот российского товара
      */
     public static class DocumentRussianProductIntroduction {
-        public DocumentIntroductionFormat documentType;
-        public String productDocument;
-        public String productGroup;
+        public final DocumentIntroductionFormat documentType;
+        public final String productDocument;
+        public final String productGroup;
 
         public DocumentRussianProductIntroduction(DocumentIntroductionFormat documentType, String productGroup, String productDocument) {
             this.documentType = documentType;
@@ -136,26 +177,18 @@ public class CrptApi {
      * Результат метода создания документа на ввод в оборот российского товара
      */
     public static final class DocumentId {
-        /**
-         * Уникальный идентификатор документа в ИС МП
-         */
         public String value;
-
-        @Override
-        public String toString() {
-            return "{value=" + value + '\"' + '}';
-        }
     }
 
     /**
      * Тело метода создания документа на ввод в оборот российского товара
      */
     private static class MethodPayload {
-        public String document_format;
-        public String product_document;
-        public String product_group;
-        public String type;
-        public String signature;
+        public final String document_format;
+        public final String product_document;
+        public final String product_group;
+        public final String type;
+        public final String signature;
 
         public MethodPayload(String document_format, String product_document, String product_group, String type, String signature) {
             this.document_format = document_format;
@@ -169,9 +202,13 @@ public class CrptApi {
     /**
      * DTO результата запроса авторизации
      */
-    private static class CertKeyPayload {
+    static class CertKeyPayload {
         public String uuid;
         public String data;
+    }
+
+    static class TokenPayload {
+        public String token;
     }
 
     /** Заданный период времени в миллисекундах */
@@ -182,16 +219,16 @@ public class CrptApi {
     private int currentCount;
 
     /** HTTP-клиент */
-    private final HttpClient httpClient;
+    final HttpClient httpClient;
 
     /** Конфигурация приложения */
     private final AppConfig appConfig;
 
     /** Маппер объектов */
-    private final ObjectMapper objectMapper;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** Кэш*/
-    private Cache cache;
+    private TokenCache cache;
     /** API подписи ключа */
     private CryptoSign cryptoSign;
 
@@ -228,7 +265,7 @@ public class CrptApi {
      * @param cryptoSign API подписи ключа
      * @param meterRegistry Регистратор метрик
      */
-    public CrptApi(AppConfig appConfig, CrptApi.Cache cache, CrptApi.CryptoSign cryptoSign, MeterRegistry meterRegistry) {
+    public CrptApi(AppConfig appConfig, CrptApi.TokenCache cache, CrptApi.CryptoSign cryptoSign, MeterRegistry meterRegistry) {
         this.metricsMap.put("createDocumentOfRussianProduct", new Metrics(meterRegistry, "createDocumentOfRussianProduct"));
 
         this.periodMillis = appConfig.timeUnit.toMillis(1);
@@ -236,7 +273,6 @@ public class CrptApi {
         this.currentCount = 0;
         this.httpClient = HttpClient.newHttpClient();
         this.appConfig = appConfig;
-        this.objectMapper = new ObjectMapper();
 
         this.cache = cache;
         this.cryptoSign = cryptoSign;
@@ -254,7 +290,7 @@ public class CrptApi {
                 currentCount = 0;
                 notifyAll();
             }
-            if (currentCount < this.appConfig.requestLimit) {
+            if (currentCount < this.appConfig.getRequestLimit()) {
                 currentCount++;
                 break;
             }
@@ -275,45 +311,60 @@ public class CrptApi {
      * @param payload Тело метода API в виде строки
      * @param returnType Тип возвращаемого значения
      */
-    private <R> R callPostApi(String methodName, String url, String payload, Class<R> returnType) {
+    <D, R> R callPostApiWithMetrics(String methodName, String url, D payload, Class<R> returnType) throws InterruptedException {
         var metrics = metricsMap.get(methodName);
-        return metrics.executionTimer.record(() -> {
-            logger.info("{}: payload = {}", methodName, payload);
-            try {
-                acquirePermit();
 
-                var request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", "Bearer " + getToken())
-                        .POST(HttpRequest.BodyPublishers.ofString(payload))
-                        .build();
+        try {
+            return metrics.executionTimer.record(() -> callPostApi(methodName, url, payload, returnType, metrics));
+        } catch (CompletionException e) {
+            throw (InterruptedException) e.getCause();
+        }
+    }
 
-                var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+     <D, R> R callPostApi(String methodName, String url, D payload, Class<R> returnType, Metrics metrics) {
+        logger.info("{}: payload = {}", methodName, payload);
+        try {
+            var payloadAsString = objectMapper.writeValueAsString(payload);
 
-                if (response.statusCode() == 401) {
-                    cache.delete("token");
-                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                }
+            acquirePermit();
 
-                if (response.statusCode() >= 400) {
-                    System.out.println(response.statusCode());
-                    throw new CrptApiException(response.statusCode());
-                }
+            var request = HttpRequest.newBuilder()
+                    .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + getToken())
+                    .POST(HttpRequest.BodyPublishers.ofString(payloadAsString))
+                    .build();
 
-                var bodyString = response.body();
+            var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-                var responseBody = objectMapper.readValue(bodyString, returnType);
-
-                logger.info("success: {}: result = {}", methodName, responseBody);
-
-                return responseBody;
-            } catch (Exception e) {
-                logger.error("error on method: {}, error: ", methodName, e);
-                metrics.failureCounter.increment();
-                throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
+            if (response.statusCode() == 401) {
+                logger.info("query with new token, {}: payload = {}", methodName, payload);
+                cache.delete("token");
+                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             }
-        });
+
+            if (response.statusCode() >= 400) {
+                throw new CrptApiException(response.statusCode());
+            }
+
+            var bodyString = response.body();
+
+            var responseBody = objectMapper.readValue(bodyString, returnType);
+
+            logger.info("success: {}: result = {}", methodName, responseBody);
+
+            return responseBody;
+        } catch (JacksonException e) {
+            logger.error("error on method: {}, error: ", methodName, e);
+            metrics.failureCounter.increment();
+            throw new CrptApiException(e, CrptApiException.ErrorCode.FORMAT_ERROR);
+        } catch (IOException e) {
+            logger.error("error on method: {}, error: ", methodName, e);
+            metrics.failureCounter.increment();
+            throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
+        } catch (InterruptedException e) {
+            throw new CompletionException(e);
+        }
     }
 
     /**
@@ -323,18 +374,14 @@ public class CrptApi {
      * @param signature Строка с открепленной подписью в формате base64.
      * @return объект `DocumentId`, содержащий статус ответа и тело ответа.
      */
-    public DocumentId createDocumentOfRussianProduct(DocumentRussianProductIntroduction document, String signature) {
-        try {
-            var payload = preparePayload(document, signature);
-            return callPostApi(
-                    "createDocumentOfRussianProduct",
-                    String.format("%s://%s/api/v3/lk/documents/create", appConfig.apiProtocol, appConfig.apiHost),
-                    payload,
-                    DocumentId.class
-            );
-        } catch (JsonProcessingException e) {
-            throw new CrptApiException(e, CrptApiException.ErrorCode.RESPONSE_FORMAT_ERROR);
-        }
+    public DocumentId createDocumentOfRussianProduct(DocumentRussianProductIntroduction document, String signature) throws InterruptedException {
+        var payload = preparePayload(document, signature);
+        return callPostApiWithMetrics(
+                "createDocumentOfRussianProduct",
+                "/api/v3/lk/documents/create",
+                payload,
+                DocumentId.class
+        );
     }
 
     /**
@@ -345,44 +392,66 @@ public class CrptApi {
             CertKeyPayload response;
             try {
                 response = fetchCertKey();
+                response.data = cryptoSign.sign(response.data);
+                var tokenPayload = fetchToken(response);
+
+                return tokenPayload.token;
             } catch (IOException e) {
                 throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
             } catch (InterruptedException e) {
-                try {
-                    throw e;
-                } catch (InterruptedException exc) {
-                    throw new RuntimeException(exc);
-                }
+                throw new CompletionException(e);
             }
-            return cryptoSign.sign(response.data);
         });
     }
 
     /**
      * Подготовка тело для метода создания документа
      */
-    private String preparePayload(DocumentRussianProductIntroduction document, String signature) throws JsonProcessingException {
-        var payload = new MethodPayload(
+    private MethodPayload preparePayload(DocumentRussianProductIntroduction document, String signature) {
+        return new MethodPayload(
                 document.documentType.documentTypeFormat,
                 document.productDocument,
                 document.productDocument,
                 document.documentType.documentTypeRussianProduct,
                 signature
         );
-        return objectMapper.writeValueAsString(payload);
     }
 
-    private CertKeyPayload fetchCertKey() throws IOException, InterruptedException {
+    CertKeyPayload fetchCertKey() throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(String.format("%s://%s/api/v3/auth/cert/key", appConfig.apiProtocol, appConfig.apiHost)))
+                .uri(URI.create(String.format("%s://%s/api/v3/auth/cert/key", appConfig.getApiProtocol(), appConfig.getApiHost())))
                 .GET()
                 .header("Accept", "application/json")
                 .build();
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
+        if (response.statusCode() >= 300) {
+            throw new CrptApiException(response.statusCode());
+        }
+
         var body = response.body();
 
         return objectMapper.readValue(body, CertKeyPayload.class);
+    }
+
+    TokenPayload fetchToken(CertKeyPayload cert) throws IOException, InterruptedException {
+        var certAsString = objectMapper.writeValueAsString(cert);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(String.format("%s://%s/api/v3/auth/cert", appConfig.getApiProtocol(), appConfig.getApiHost())))
+                .POST(HttpRequest.BodyPublishers.ofString(certAsString))
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() >= 300) {
+            throw new CrptApiException(response.statusCode());
+        }
+
+        var body = response.body();
+
+        return objectMapper.readValue(body, TokenPayload.class);
     }
 }
