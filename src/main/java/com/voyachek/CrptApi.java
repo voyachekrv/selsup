@@ -29,6 +29,12 @@ import java.util.function.Function;
  */
 public class CrptApi {
 
+    private static final class Constants {
+        public static final String TOKEN_KEY = "token";
+        public static final String API_METHOD_NAME = "createDocumentOfRussianProduct";
+        public static final String APPLICATION_JSON = "application/json";
+    }
+
     /** Логгер */
     private static final Logger logger = LoggerFactory.getLogger(CrptApi.class);
 
@@ -420,8 +426,8 @@ public class CrptApi {
      */
     public CrptApi(AppConfig appConfig, CrptApi.TokenCache cache, CrptApi.CryptoSign cryptoSign, MeterRegistry meterRegistry) {
         this.metricsMap.put(
-                "createDocumentOfRussianProduct",
-                new Metrics(meterRegistry, "createDocumentOfRussianProduct"
+                Constants.API_METHOD_NAME,
+                new Metrics(meterRegistry, Constants.API_METHOD_NAME
                 ));
 
         this.periodMillis = appConfig.timeUnit.toMillis(1);
@@ -474,7 +480,7 @@ public class CrptApi {
 
             if (response.statusCode() == 401) {
                 logger.info("query with new token, {}: payload = {}", methodName, payload);
-                cache.delete("token");
+                cache.delete(Constants.TOKEN_KEY);
                 var repeatedRequest = makeApiPostRequest(url, payload);
                 response = httpClient.send(repeatedRequest, HttpResponse.BodyHandlers.ofString());
             }
@@ -528,7 +534,7 @@ public class CrptApi {
 
         return HttpRequest.newBuilder()
                 .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
-                .header("Content-Type", "application/json")
+                .header("Content-Type", Constants.APPLICATION_JSON)
                 .POST(HttpRequest.BodyPublishers.ofString(payloadAsString));
     }
 
@@ -549,7 +555,7 @@ public class CrptApi {
         return HttpRequest.newBuilder()
                 .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
                 .GET()
-                .header("Accept", "application/json")
+                .header("Accept", Constants.APPLICATION_JSON)
                 .build();
     }
 
@@ -563,7 +569,7 @@ public class CrptApi {
     public DocumentId createDocumentOfRussianProduct(DocumentRussianProductIntroduction document, String signature) throws InterruptedException {
         var payload = preparePayload(document, signature);
         return callPostApiWithMetrics(
-                "createDocumentOfRussianProduct",
+                Constants.API_METHOD_NAME,
                 "/api/v3/lk/documents/create",
                 payload,
                 DocumentId.class
@@ -574,7 +580,7 @@ public class CrptApi {
      * Получение токена из кэша, если токена не найден, то производится подпись нового токена
      */
     private String getToken() {
-        return cache.get("token", (token) -> {
+        return cache.get(Constants.TOKEN_KEY, (token) -> {
             CertKeyPayload response;
             try {
                 response = fetchCertKey();
