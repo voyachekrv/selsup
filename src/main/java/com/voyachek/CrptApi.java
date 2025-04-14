@@ -548,8 +548,6 @@ public class CrptApi {
                 return tokenPayload.token;
             } catch (IOException e) {
                 throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
-            } catch (CrptApiException e) {
-                throw e;
             } catch (InterruptedException e) {
                 throw new CompletionException(e);
             }
