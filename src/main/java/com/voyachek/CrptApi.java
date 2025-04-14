@@ -1,7 +1,10 @@
 package com.voyachek;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -139,7 +142,7 @@ public class CrptApi {
         }
 
         public int statusCode = -1;
-        public ErrorCode errorCode;
+        public final ErrorCode errorCode;
 
         public CrptApiException(Throwable cause, ErrorCode errorCode) {
             super(cause);
@@ -166,8 +169,6 @@ public class CrptApi {
         private String apiProtocol = "http";
         /** Хост API */
         private String apiHost = "localhost:3000";
-        /** Лимит запросов */
-        private int requestLimit = 100;
         /** Единица времени */
         private TimeUnit timeUnit = TimeUnit.SECONDS;
         /** Размер хранилища корзины токенов */
@@ -183,10 +184,6 @@ public class CrptApi {
             return apiHost;
         }
 
-        public int getRequestLimit() {
-            return requestLimit;
-        }
-
         public TimeUnit getTimeUnit() {
             return timeUnit;
         }
@@ -197,10 +194,6 @@ public class CrptApi {
 
         public void setApiHost(String apiHost) {
             this.apiHost = apiHost;
-        }
-
-        public void setRequestLimit(int requestLimit) {
-            this.requestLimit = requestLimit;
         }
 
         public void setTimeUnit(TimeUnit timeUnit) {
@@ -299,24 +292,45 @@ public class CrptApi {
      */
     public static final class DocumentId {
         public String value;
+
+        @JsonIgnore
+        @Override
+        public String toString() {
+            return "DocumentId{" +
+                    "value='" + value + '\'' +
+                    '}';
+        }
     }
 
     /**
      * Тело метода создания документа на ввод в оборот российского товара
      */
+    @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
     private static class MethodPayload {
-        public final String document_format;
-        public final String product_document;
-        public final String product_group;
+        public final String documentFormat;
+        public final String productDocument;
+        public final String productGroup;
         public final String type;
         public final String signature;
 
-        public MethodPayload(String document_format, String product_document, String product_group, String type, String signature) {
-            this.document_format = document_format;
-            this.product_document = product_document;
-            this.product_group = product_group;
+        public MethodPayload(String documentFormat, String productDocument, String productGroup, String type, String signature) {
+            this.documentFormat = documentFormat;
+            this.productDocument = productDocument;
+            this.productGroup = productGroup;
             this.type = type;
             this.signature = signature;
+        }
+
+        @JsonIgnore
+        @Override
+        public String toString() {
+            return "MethodPayload{" +
+                    "documentFormat='" + documentFormat + '\'' +
+                    ", productDocument='" + productDocument + '\'' +
+                    ", productGroup='" + productGroup + '\'' +
+                    ", type='" + type + '\'' +
+                    ", signature='" + signature + '\'' +
+                    '}';
         }
     }
 
@@ -326,6 +340,15 @@ public class CrptApi {
     static class CertKeyPayload {
         public String uuid;
         public String data;
+
+        @JsonIgnore
+        @Override
+        public String toString() {
+            return "CertKeyPayload{" +
+                    "uuid='" + uuid + '\'' +
+                    ", data='" + data + '\'' +
+                    '}';
+        }
     }
 
     /**
@@ -333,6 +356,14 @@ public class CrptApi {
      */
     static class TokenPayload {
         public String token;
+
+        @JsonIgnore
+        @Override
+        public String toString() {
+            return "TokenPayload{" +
+                    "token='" + token + '\'' +
+                    '}';
+        }
     }
 
     /** Заданный период времени в миллисекундах */
@@ -348,11 +379,11 @@ public class CrptApi {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** Кэш*/
-    private TokenCache cache;
+    private final TokenCache cache;
     /** API подписи ключа */
-    private CryptoSign cryptoSign;
+    private final CryptoSign cryptoSign;
 
-    private BlockingTokenBucketRateLimiter limiter;
+    private final BlockingTokenBucketRateLimiter limiter;
 
     /** Метрики для метода вызова API */
     private static class Metrics {
