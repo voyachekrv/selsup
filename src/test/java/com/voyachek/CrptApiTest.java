@@ -1,135 +1,172 @@
 package com.voyachek;
 
-import com.voyachek.CrptApi.AppConfig;
 import com.voyachek.CrptApi.DocumentId;
-import com.voyachek.CrptApi.DocumentIntroductionFormat;
 import com.voyachek.CrptApi.DocumentRussianProductIntroduction;
-import com.voyachek.CrptApi.ProductGroup;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
-import static org.assertj.core.api.Assertions.assertThat;
+import static com.voyachek.CrptApi.DocumentTypeRussianProductIntroduction.MANUAL;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class CrptApiTest {
-
-    private CrptApi.TokenCache cache;
-    private CrptApi.CryptoSign cryptoSign;
     private CrptApi api;
-
-    private AppConfig config;
+    private CrptApi.TokenCache tokenCache;
+    private CrptApi.CryptoSign cryptoSign;
+    private HttpClient httpClient;
+    private SimpleMeterRegistry meterRegistry;
+    private CrptApi.AppConfig appConfig;
 
     @BeforeEach
-    void setUp() {
-        cache = mock(CrptApi.TokenCache.class);
+    public void setUp() throws Exception {
+        meterRegistry = new SimpleMeterRegistry();
+        tokenCache = mock(CrptApi.TokenCache.class);
         cryptoSign = mock(CrptApi.CryptoSign.class);
+        appConfig = new CrptApi.AppConfig();
 
-        config = new AppConfig();
-        config.setTimeUnit(TimeUnit.SECONDS);
+        appConfig.setApiProtocol("http");
+        appConfig.setApiHost("localhost:3000");
 
-        api = spy(new CrptApi(config, cache, cryptoSign, new SimpleMeterRegistry()));
+        api = new CrptApi(appConfig, tokenCache, cryptoSign, meterRegistry);
 
-        when(cache.get(eq("token"), any())).thenReturn("test-token");
+        httpClient = mock(HttpClient.class);
+        Field clientField = CrptApi.class.getDeclaredField("httpClient");
+        clientField.setAccessible(true);
+        clientField.set(api, httpClient);
     }
 
     @Test
-    void testCreateDocumentSuccess() throws InterruptedException {
-        DocumentRussianProductIntroduction document = new DocumentRussianProductIntroduction(
-                CrptApi.DocumentTypeRussianProductIntroduction.CSV,
-                ProductGroup.CLOTHES,
-                "{\"test\":\"data\"}"
+    public void testSuccessCreateDocumentOfRussianProduct() throws Exception {
+        var dummyToken = "dummy-token";
+        when(tokenCache.get(eq("token"), any())).thenReturn(dummyToken);
+
+        var documentId = new DocumentId();
+        documentId.value = "doc-123";
+
+        var httpResponse = mock(HttpResponse.class);
+        when(httpResponse.statusCode()).thenReturn(200);
+        when(httpResponse.body()).thenReturn("{\"value\":\"doc-123\"}");
+
+        when(httpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenReturn(httpResponse);
+
+        var doc = new DocumentRussianProductIntroduction(
+                MANUAL,
+                "group1",
+                "document-content"
         );
 
-        DocumentId expected = new DocumentId();
-        expected.value = "12345";
+        var result = api.createDocumentOfRussianProduct(doc, "signature123");
 
-        doReturn(expected).when(api).callPostApiWithMetrics(
-                eq("createDocumentOfRussianProduct"),
-                anyString(),
-                any(),
-                eq(DocumentId.class)
-        );
-
-        DocumentId actual = api.createDocumentOfRussianProduct(document, "mock-signature");
-
-        assertThat(actual).isNotNull();
-        assertThat(actual.value).isEqualTo("12345");
+        assertNotNull(result);
+        assertEquals("doc-123", result.value);
+        verify(tokenCache).get(eq("token"), any());
     }
 
     @Test
-    void testCreateDocumentThrowsException() throws InterruptedException {
-        DocumentRussianProductIntroduction document = new DocumentRussianProductIntroduction(
-                CrptApi.DocumentTypeRussianProductIntroduction.CSV,
-                ProductGroup.SHOES,
-                "{\"test\":\"fail\"}"
+    public void testErrorCreatingDocumentApiSide() throws Exception {
+        var dummyToken = "dummy-token";
+        when(tokenCache.get(eq("token"), any())).thenReturn(dummyToken);
+
+        var httpResponse = mock(HttpResponse.class);
+        when(httpResponse.statusCode()).thenReturn(500);
+        when(httpResponse.body()).thenReturn("Internal Server Error");
+
+        when(httpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenReturn(httpResponse);
+
+        DocumentRussianProductIntroduction doc = new DocumentRussianProductIntroduction(
+                MANUAL,
+                "group1",
+                "document-content"
         );
 
-        // Имитируем исключение при вызове API
-        doThrow(new CrptApi.CrptApiException(500))
-                .when(api)
-                .callPostApiWithMetrics(anyString(), anyString(), any(), eq(DocumentId.class));
-
-        CrptApi.CrptApiException exception = assertThrows(
-                CrptApi.CrptApiException.class,
-                () -> api.createDocumentOfRussianProduct(document, "sig")
+        CrptApi.CrptApiException ex = assertThrows(CrptApi.CrptApiException.class, () ->
+                api.createDocumentOfRussianProduct(doc, "signature123")
         );
-
-        assertThat(exception.statusCode).isEqualTo(500);
-        assertThat(exception.errorCode).isEqualTo(CrptApi.CrptApiException.ErrorCode.STATUS_CODE_ERROR);
+        assertEquals(500, ex.statusCode);
     }
 
     @Test
-    void testTokenFromCache() throws InterruptedException {
-        when(cache.get(eq("token"), any())).thenReturn("cached-token");
-
-        String token = api.createDocumentOfRussianProduct(
-                new CrptApi.DocumentRussianProductIntroduction(
-                        CrptApi.DocumentTypeRussianProductIntroduction.CSV,
-                        CrptApi.ProductGroup.CLOTHES,
-                        "{}"
-                ),
-                "signature"
-        ).value;
-
-        assertThat(token).isNotNull();
-    }
-
-    @Test
-    void testTokenSignatureAndFetch() throws Exception {
-        var fakeCert = new CrptApi.CertKeyPayload();
-        fakeCert.data = "raw-cert-data";
-
-        var signedCert = "signed-cert";
-        var tokenPayload = new CrptApi.TokenPayload();
-        tokenPayload.token = "signed-token-xyz";
-
-        doReturn(fakeCert).when(api).fetchCertKey();
-        when(cryptoSign.sign("raw-cert-data")).thenReturn(signedCert);
-        doReturn(tokenPayload).when(api).fetchToken(any());
-
-        when(cache.get(eq("token"), any())).thenAnswer(invocation -> {
-            Function<String, String> loader = invocation.getArgument(1);
-            return loader.apply("token");
+    public void testErrorObtainingStringForCertificateSigning() throws Exception {
+        when(tokenCache.get(eq("token"), any())).thenAnswer(invocation -> {
+            Function<String, String> supplier = invocation.getArgument(1);
+            return supplier.apply(null);
         });
 
-        String result = api.createDocumentOfRussianProduct(
-                new CrptApi.DocumentRussianProductIntroduction(
-                        CrptApi.DocumentTypeRussianProductIntroduction.CSV,
-                        CrptApi.ProductGroup.CLOTHES,
-                        "{}"
-                ),
-                "signature"
-        ).value;
+        var certKeyResponse = mock(HttpResponse.class);
+        when(certKeyResponse.statusCode()).thenReturn(200);
+        when(certKeyResponse.body()).thenReturn("{\"uuid\":\"uuid-123\", \"data\":\"data-to-sign\"}");
+        when(httpClient.send(argThat(req -> req.uri().toString().contains("/api/v3/auth/cert/key")),
+                any(HttpResponse.BodyHandler.class)))
+                .thenReturn(certKeyResponse);
 
-        assertThat(result).isNotNull();
+        when(cryptoSign.sign("data-to-sign")).thenThrow(new RuntimeException("Signing error"));
+
+        var doc = new DocumentRussianProductIntroduction(
+                MANUAL,
+                "group1",
+                "document-content"
+        );
+
+        var ex = assertThrows(RuntimeException.class, () ->
+                api.createDocumentOfRussianProduct(doc, "signature123")
+        );
+        assertTrue(ex.getMessage().contains("Signing error"));
+    }
+
+    @Test
+    public void testErrorObtainingToken() throws Exception {
+        when(tokenCache.get(eq("token"), any())).thenAnswer(invocation -> {
+            Function<String, String> supplier = invocation.getArgument(1);
+            return supplier.apply(null);
+        });
+
+        var certKeyResponse = mock(HttpResponse.class);
+        when(certKeyResponse.statusCode()).thenReturn(401);
+        when(certKeyResponse.body()).thenReturn("Unauthorized");
+
+        when(httpClient.send(argThat(req -> req.uri().toString().contains("/api/v3/auth/cert/key")),
+                any(HttpResponse.BodyHandler.class)))
+                .thenReturn(certKeyResponse);
+
+        var doc = new DocumentRussianProductIntroduction(
+                MANUAL,
+                "group1",
+                "document-content"
+        );
+
+        var ex = assertThrows(CrptApi.CrptApiException.class, () ->
+                api.createDocumentOfRussianProduct(doc, "signature123")
+        );
+        assertEquals(401, ex.statusCode);
+    }
+
+    @Test
+    public void testBlockingTokenBucketRateLimiter() throws InterruptedException {
+        long capacity = 1;
+        long refillTokens = 1;
+        long refillPeriod = 1000;
+        var limiter =
+                new CrptApi.BlockingTokenBucketRateLimiter(capacity, refillTokens, refillPeriod, TimeUnit.MILLISECONDS);
+
+        limiter.acquire();
+        long startTime = System.currentTimeMillis();
+        limiter.acquire();
+
+        long duration = System.currentTimeMillis() - startTime;
+        assertTrue(duration >= refillPeriod * 0.8, "Время ожидания должно быть приблизительно не меньше периода наполнения");
     }
 }
 

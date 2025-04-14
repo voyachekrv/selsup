@@ -17,6 +17,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
 /**
@@ -39,6 +41,88 @@ public class CrptApi {
     /** API подписи ключа */
     public interface CryptoSign {
         String sign(String value);
+    }
+
+    /**
+     * Потокобезопасный блокирующий ограничитель скорости на основе алгоритма корзины токенов.
+     */
+    public static class BlockingTokenBucketRateLimiter {
+        private final long capacity;
+        private final long refillTokens;
+        private final long refillPeriodMillis;
+        private long availableTokens;
+        private long lastRefillTime;
+        private final Lock lock = new ReentrantLock();
+
+        /**
+         * @param capacity максимальное количество токенов в корзине
+         * @param refillTokens количество токенов, добавляемых при каждом пополнении
+         * @param refillPeriod периодичность пополнения токенов
+         * @param timeUnit единицы измерения периода пополнения
+         */
+        public BlockingTokenBucketRateLimiter(long capacity, long refillTokens, long refillPeriod, TimeUnit timeUnit) {
+            this.capacity = capacity;
+            this.refillTokens = refillTokens;
+            this.refillPeriodMillis = timeUnit.toMillis(refillPeriod);
+            this.availableTokens = capacity;
+            this.lastRefillTime = System.currentTimeMillis();
+        }
+
+        /**
+         * Запрашивает один токен у ограничителя. Если токенов нет — поток блокируется до тех пор, пока не появится доступный токен.
+         */
+        public void acquire() throws InterruptedException {
+            acquire(1);
+        }
+
+        /**
+         * Запрашивает указанное количество токенов у ограничителя.
+         * Если недостаточно токенов — поток блокируется до их появления.
+         * @param permits количество необходимых токенов
+         */
+        public void acquire(int permits) throws InterruptedException {
+            while (true) {
+                lock.lock();
+                try {
+                    refillTokens();
+
+                    if (availableTokens >= permits) {
+                        availableTokens -= permits;
+                        return;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+
+                Thread.sleep(calculateWaitTime(permits));
+            }
+        }
+
+        /**
+         * Пополняет количество доступных токенов на основе времени,
+         * прошедшего с последнего пополнения.
+         */
+        private void refillTokens() {
+            long now = System.currentTimeMillis();
+            long elapsed = now - lastRefillTime;
+
+            if (elapsed > refillPeriodMillis) {
+                long refillCount = elapsed / refillPeriodMillis;
+                availableTokens = Math.min(capacity, availableTokens + refillCount * refillTokens);
+                lastRefillTime = now;
+            }
+        }
+
+        /**
+         * Вычисляет примерное время ожидания (в миллисекундах), необходимое до появления нужного количества токенов.
+         */
+        private long calculateWaitTime(int permits) {
+            if (availableTokens >= permits) return 0;
+
+            long tokensNeeded = permits - availableTokens;
+            long refillsNeeded = (tokensNeeded + refillTokens - 1) / refillTokens;
+            return refillsNeeded * refillPeriodMillis;
+        }
     }
 
     /** Исключения */
@@ -131,6 +215,14 @@ public class CrptApi {
             this.documentTypeFormat = documentTypeFormat;
             this.documentTypeRussianProduct = documentTypeRussianProduct;
         }
+
+        @Override
+        public String toString() {
+            return "DocumentIntroductionFormat{" +
+                    "documentTypeFormat='" + documentTypeFormat + '\'' +
+                    ", documentTypeRussianProduct='" + documentTypeRussianProduct + '\'' +
+                    '}';
+        }
     }
 
     /**
@@ -170,6 +262,15 @@ public class CrptApi {
             this.documentType = documentType;
             this.productDocument = productDocument;
             this.productGroup = productGroup;
+        }
+
+        @Override
+        public String toString() {
+            return "DocumentRussianProductIntroduction{" +
+                    "documentType=" + documentType +
+                    ", productDocument='" + productDocument + '\'' +
+                    ", productGroup='" + productGroup + '\'' +
+                    '}';
         }
     }
 
@@ -213,13 +314,9 @@ public class CrptApi {
 
     /** Заданный период времени в миллисекундах */
     private final long periodMillis;
-    /** Время старта окна */
-    private long windowStart;
-    /** Текущее количество запросов */
-    private int currentCount;
 
     /** HTTP-клиент */
-    final HttpClient httpClient;
+    final HttpClient httpClient = HttpClient.newHttpClient();
 
     /** Конфигурация приложения */
     private final AppConfig appConfig;
@@ -269,38 +366,10 @@ public class CrptApi {
         this.metricsMap.put("createDocumentOfRussianProduct", new Metrics(meterRegistry, "createDocumentOfRussianProduct"));
 
         this.periodMillis = appConfig.timeUnit.toMillis(1);
-        this.windowStart = System.currentTimeMillis();
-        this.currentCount = 0;
-        this.httpClient = HttpClient.newHttpClient();
         this.appConfig = appConfig;
 
         this.cache = cache;
         this.cryptoSign = cryptoSign;
-    }
-
-    /**
-     * Обеспечение ограничения по числу запросов.
-     * Если достигнут лимит, вызывающий поток блокируется до начала следующего интервала.
-     */
-    private synchronized void acquirePermit() throws InterruptedException {
-        while (true) {
-            long now = System.currentTimeMillis();
-            if (now - windowStart >= periodMillis) {
-                windowStart = now;
-                currentCount = 0;
-                notifyAll();
-            }
-            if (currentCount < this.appConfig.getRequestLimit()) {
-                currentCount++;
-                break;
-            }
-            long waitTime = periodMillis - (now - windowStart);
-            if (waitTime <= 0) {
-                wait(1);
-            } else {
-                wait(waitTime);
-            }
-        }
     }
 
     /**
@@ -324,26 +393,25 @@ public class CrptApi {
      <D, R> R callPostApi(String methodName, String url, D payload, Class<R> returnType, Metrics metrics) {
         logger.info("{}: payload = {}", methodName, payload);
         try {
+
+            var limiter = new BlockingTokenBucketRateLimiter(10, 10, periodMillis, TimeUnit.SECONDS);
+
+            limiter.acquire();
+
             var payloadAsString = objectMapper.writeValueAsString(payload);
 
-            acquirePermit();
-
-            var request = HttpRequest.newBuilder()
-                    .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", "Bearer " + getToken())
-                    .POST(HttpRequest.BodyPublishers.ofString(payloadAsString))
-                    .build();
+            var request = makeApiPostRequest(url, payloadAsString);
 
             var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() == 401) {
                 logger.info("query with new token, {}: payload = {}", methodName, payload);
                 cache.delete("token");
-                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                var repeatedRequest = makeApiPostRequest(url, payloadAsString);
+                response = httpClient.send(repeatedRequest, HttpResponse.BodyHandlers.ofString());
             }
 
-            if (response.statusCode() >= 400) {
+            if (response.statusCode() >= 300) {
                 throw new CrptApiException(response.statusCode());
             }
 
@@ -365,6 +433,15 @@ public class CrptApi {
         } catch (InterruptedException e) {
             throw new CompletionException(e);
         }
+    }
+
+    private HttpRequest makeApiPostRequest(String url, String payload) {
+        return HttpRequest.newBuilder()
+                .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + getToken())
+                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .build();
     }
 
     /**
