@@ -1,6 +1,5 @@
 package com.voyachek;
 
-import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -32,7 +31,7 @@ public class CrptApi {
     /** Кэш */
     public interface TokenCache {
         /** Получение значения из кэша */
-        String get(String key, Function<String, String> value);
+        String get(String key, Function<String, String> valueLoader);
 
         /** Удаление значения из кэша */
         void delete(String key);
@@ -170,6 +169,10 @@ public class CrptApi {
         private int requestLimit = 100;
         /** Единица времени */
         private TimeUnit timeUnit = TimeUnit.SECONDS;
+        /** Размер хранилища корзины токенов */
+        private long tokenBucketCapacity = 10;
+        /** количество токенов, добавляемых при каждом пополнении */
+        private long tokenBucketRefillTokens = 10;
 
         public String getApiProtocol() {
             return apiProtocol;
@@ -201,6 +204,22 @@ public class CrptApi {
 
         public void setTimeUnit(TimeUnit timeUnit) {
             this.timeUnit = timeUnit;
+        }
+
+        public long getTokenBucketCapacity() {
+            return tokenBucketCapacity;
+        }
+
+        public void setTokenBucketCapacity(long tokenBucketCapacity) {
+            this.tokenBucketCapacity = tokenBucketCapacity;
+        }
+
+        public long getTokenBucketRefillTokens() {
+            return tokenBucketRefillTokens;
+        }
+
+        public void setTokenBucketRefillTokens(long tokenBucketRefillTokens) {
+            this.tokenBucketRefillTokens = tokenBucketRefillTokens;
         }
     }
 
@@ -308,6 +327,9 @@ public class CrptApi {
         public String data;
     }
 
+    /**
+     * DTO полученного токена
+     */
     static class TokenPayload {
         public String token;
     }
@@ -328,6 +350,8 @@ public class CrptApi {
     private TokenCache cache;
     /** API подписи ключа */
     private CryptoSign cryptoSign;
+
+    private BlockingTokenBucketRateLimiter limiter;
 
     /** Метрики для метода вызова API */
     private static class Metrics {
@@ -363,13 +387,22 @@ public class CrptApi {
      * @param meterRegistry Регистратор метрик
      */
     public CrptApi(AppConfig appConfig, CrptApi.TokenCache cache, CrptApi.CryptoSign cryptoSign, MeterRegistry meterRegistry) {
-        this.metricsMap.put("createDocumentOfRussianProduct", new Metrics(meterRegistry, "createDocumentOfRussianProduct"));
+        this.metricsMap.put(
+                "createDocumentOfRussianProduct",
+                new Metrics(meterRegistry, "createDocumentOfRussianProduct"
+                ));
 
         this.periodMillis = appConfig.timeUnit.toMillis(1);
         this.appConfig = appConfig;
 
         this.cache = cache;
         this.cryptoSign = cryptoSign;
+
+        this.limiter = new BlockingTokenBucketRateLimiter(
+                appConfig.getTokenBucketCapacity(),
+                appConfig.getTokenBucketRefillTokens(),
+                periodMillis,
+                TimeUnit.SECONDS);
     }
 
     /**
@@ -390,24 +423,27 @@ public class CrptApi {
         }
     }
 
+    /**
+     * Шаблонный метод вызова логируемого метода POST API с метриками
+     * @param methodName название метода
+     * @param url URL метода
+     * @param payload Тело метода
+     * @param returnType Тип возвращаемого метода
+     * @param metrics Метрики
+     */
      <D, R> R callPostApi(String methodName, String url, D payload, Class<R> returnType, Metrics metrics) {
         logger.info("{}: payload = {}", methodName, payload);
         try {
-
-            var limiter = new BlockingTokenBucketRateLimiter(10, 10, periodMillis, TimeUnit.SECONDS);
-
             limiter.acquire();
 
-            var payloadAsString = objectMapper.writeValueAsString(payload);
-
-            var request = makeApiPostRequest(url, payloadAsString);
+            var request = makeApiPostRequest(url, payload);
 
             var response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() == 401) {
                 logger.info("query with new token, {}: payload = {}", methodName, payload);
                 cache.delete("token");
-                var repeatedRequest = makeApiPostRequest(url, payloadAsString);
+                var repeatedRequest = makeApiPostRequest(url, payload);
                 response = httpClient.send(repeatedRequest, HttpResponse.BodyHandlers.ofString());
             }
 
@@ -422,10 +458,10 @@ public class CrptApi {
             logger.info("success: {}: result = {}", methodName, responseBody);
 
             return responseBody;
-        } catch (JacksonException e) {
+        } catch (CrptApiException e) {
             logger.error("error on method: {}, error: ", methodName, e);
             metrics.failureCounter.increment();
-            throw new CrptApiException(e, CrptApiException.ErrorCode.FORMAT_ERROR);
+            throw e;
         } catch (IOException e) {
             logger.error("error on method: {}, error: ", methodName, e);
             metrics.failureCounter.increment();
@@ -435,12 +471,49 @@ public class CrptApi {
         }
     }
 
-    private HttpRequest makeApiPostRequest(String url, String payload) {
+    /**
+     * Обращение к URL метода POST
+     * @param url URL метода
+     * @param payload Тело метода
+     */
+    private <D> HttpRequest makeApiPostRequest(String url, D payload) throws IOException {
+        return getBasePostRequestBuilder(url, payload)
+                .header("Authorization", "Bearer " + getToken())
+                .build();
+    }
+
+    /**
+     * Получение билдера для POST-метода
+     * @param url URL метода
+     * @param payload Тело метода
+     */
+    private <D> HttpRequest.Builder getBasePostRequestBuilder(String url, D payload) throws IOException {
+        var payloadAsString = objectMapper.writeValueAsString(payload);
+
         return HttpRequest.newBuilder()
                 .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + getToken())
-                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .POST(HttpRequest.BodyPublishers.ofString(payloadAsString));
+    }
+
+    /**
+     * Обращение к URL метода POST без авторизации
+     * @param url URL метода
+     * @param payload Тело метода
+     */
+    private <D> HttpRequest makeApiPostNoAuthRequest(String url, D payload) throws IOException {
+        return getBasePostRequestBuilder(url, payload).build();
+    }
+
+    /**
+     * Обращение к URL метода GET
+     * @param url URL метода
+     */
+    private HttpRequest makeApiGetRequest(String url) {
+        return HttpRequest.newBuilder()
+                .uri(URI.create(String.format("%s://%s%s", appConfig.getApiProtocol(), appConfig.getApiHost(), url)))
+                .GET()
+                .header("Accept", "application/json")
                 .build();
     }
 
@@ -475,6 +548,8 @@ public class CrptApi {
                 return tokenPayload.token;
             } catch (IOException e) {
                 throw new CrptApiException(e, CrptApiException.ErrorCode.IO_ERROR);
+            } catch (CrptApiException e) {
+                throw e;
             } catch (InterruptedException e) {
                 throw new CompletionException(e);
             }
@@ -494,13 +569,12 @@ public class CrptApi {
         );
     }
 
-    CertKeyPayload fetchCertKey() throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(String.format("%s://%s/api/v3/auth/cert/key", appConfig.getApiProtocol(), appConfig.getApiHost())))
-                .GET()
-                .header("Accept", "application/json")
-                .build();
-
+    /**
+     * Отправка простого запроса со стандартной логикой обработки ответа
+     * @param request Объект HTTP Request
+     * @param responseType Тип возвращаемого ответа
+     */
+    private <R> R fetchSimpleRequest(HttpRequest request, Class<R> responseType) throws IOException, InterruptedException, CrptApiException {
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() >= 300) {
@@ -509,26 +583,20 @@ public class CrptApi {
 
         var body = response.body();
 
-        return objectMapper.readValue(body, CertKeyPayload.class);
+        return objectMapper.readValue(body, responseType);
     }
 
+    /**
+     * Запрос авторизаций
+     */
+    CertKeyPayload fetchCertKey() throws IOException, InterruptedException {
+        return fetchSimpleRequest(makeApiGetRequest("/api/v3/auth/cert/key"), CertKeyPayload.class);
+    }
+
+    /**
+     * Получение аутентификационного токена
+     */
     TokenPayload fetchToken(CertKeyPayload cert) throws IOException, InterruptedException {
-        var certAsString = objectMapper.writeValueAsString(cert);
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(String.format("%s://%s/api/v3/auth/cert", appConfig.getApiProtocol(), appConfig.getApiHost())))
-                .POST(HttpRequest.BodyPublishers.ofString(certAsString))
-                .header("Accept", "application/json")
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() >= 300) {
-            throw new CrptApiException(response.statusCode());
-        }
-
-        var body = response.body();
-
-        return objectMapper.readValue(body, TokenPayload.class);
+        return fetchSimpleRequest(makeApiPostNoAuthRequest("/api/v3/auth/cert", cert), TokenPayload.class);
     }
 }

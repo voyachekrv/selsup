@@ -1,37 +1,37 @@
 package com.voyachek;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 class CacheImpl implements CrptApi.TokenCache {
 
-    private final Map<String, String> cache = new HashMap<>();
+    private final Cache<String, String> cache;
+
+    public CacheImpl() {
+        this.cache = Caffeine.newBuilder()
+                .expireAfterWrite(10, TimeUnit.HOURS)
+                .maximumSize(100)
+                .build();
+    }
 
     @Override
-    public String get(String key, Function<String, String> value) {
-        var val = this.cache.get(key);
-
-        if (Objects.isNull(val)) {
-            return value.apply(key);
-        }
-
-        return val;
+    public String get(String key, Function<String, String> valueLoader) {
+        return cache.get(key, valueLoader);
     }
 
     @Override
     public void delete(String key) {
-        cache.remove(key);
+        cache.invalidate(key);
     }
 }
 
-class CryptoSignImpl implements CrptApi.CryptoSign {
+class CryptoSignFake implements CrptApi.CryptoSign {
     @Override
     public String sign(String value) {
         return Base64.getEncoder().encodeToString(UUID.randomUUID().toString().getBytes());
@@ -41,7 +41,7 @@ class CryptoSignImpl implements CrptApi.CryptoSign {
 public class Main {
     public static void main(String[] args) {
         try {
-            var crptApi = new CrptApi(new CrptApi.AppConfig(), new CacheImpl(), new CryptoSignImpl(), new SimpleMeterRegistry());
+            var crptApi = new CrptApi(new CrptApi.AppConfig(), new CacheImpl(), new CryptoSignFake(), new SimpleMeterRegistry());
 
             var document = crptApi.createDocumentOfRussianProduct(new CrptApi.DocumentRussianProductIntroduction(
                     CrptApi.DocumentTypeRussianProductIntroduction.MANUAL,
