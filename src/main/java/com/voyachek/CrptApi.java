@@ -1,5 +1,6 @@
 package com.voyachek;
 
+import com.fasterxml.jackson.core.JacksonException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -462,6 +463,10 @@ public class CrptApi {
             logger.error("error on method: {}, error: ", methodName, e);
             metrics.failureCounter.increment();
             throw e;
+        } catch (JacksonException e) {
+            logger.error("error on method: {}, error: ", methodName, e);
+            metrics.failureCounter.increment();
+            throw new CrptApiException(e, CrptApiException.ErrorCode.FORMAT_ERROR);
         } catch (IOException e) {
             logger.error("error on method: {}, error: ", methodName, e);
             metrics.failureCounter.increment();
